@@ -15,12 +15,6 @@ A low-level C library for Linux that automatically detects memory leaks, double-
 - ✅ Clean, minimal output format
 - ✅ Comprehensive test suite (5 tests)
 
-**Coming Soon:**
-- 🔄 Symbol resolution (addr2line for readable stack traces)
-- 🔄 File descriptor leak detection
-- 🔄 Deadlock detection
-- 🔄 JSON/HTML report generation
-
 ## Quick Start
 
 ```bash
