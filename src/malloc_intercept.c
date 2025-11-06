@@ -18,7 +18,7 @@
  * use the 'in_profiler' flag. when inside profiler code, we don't track.
  * this prevents recursion when our own code (like hash_table_add) calls malloc.
  * 
- * why we use write() instead of fprintf():
+ * we must avoid any libc functions that might call malloc.
  * write() is a direct syscall with zero dependency on libc buffering.
  * fprintf() can call malloc internally, which would break our initialization.
  */
@@ -34,86 +34,6 @@
 
 // maximum stack frames to capture
 #define MAX_STACK_FRAMES 16
-
-// safe output function - uses direct syscall, never calls malloc
-static void profiler_log(const char *msg) {
-    write(STDERR_FILENO, msg, strlen(msg));
-}
-
-/*
- * check if allocation likely came from libc infrastructure
- * 
- * examines stack trace to detect allocations from libc.so.
- * these are typically i/o buffers, locale data, etc that uses malloc internally
- * and intentionally wont be freed (global infrastructure).
- * 
- * key insight: we only check the immidiate caller (frame 1).
- * we only care if libc DIRECTLY called malloc, not user code.
- * 
- * stack example for user leak:
- *   frame 0: malloc (profiler)
- *   frame 1: main (user code) ← CHECK THIS
- *   frame 2: __libc_start_main ← ignore (just startup)
- * 
- * stack example for libc leak:
- *   frame 0: malloc (profiler)
- *   frame 1: _IO_file_doallocate (libc) ← CHECK THIS - it's libc!
- *   frame 2: puts ← doesn't matter
- * 
- * uses dladdr() which:
- * - does NOT call malloc 
- * - maps function address to its shared library- so we can detect if its lib.c
- * 
- * returns: 1 if suspicious (likely false positive), 0 if real leak
- */
-static int is_likely_libc_allocation(void **stack_trace, int depth) {
-    if (!stack_trace || depth < 2) {
-        return 0;  // can't determine, assume real
-    }
-    
-    // only check frame 1 (immediate caller of malloc)
-    // frame 0 is malloc itself, frame 1 is who called malloc
-    // dl_info is a struct which holds the inforamtion about the shared libary
-    Dl_info info;
-    
-    // dladdr() fills the 'nfo structure based on the address in trace[1]
-    if (dladdr(stack_trace[1], &info) != 0) {
-        // check if immediate caller is from libc.so
-        if (info.dli_fname && strstr(info.dli_fname, "libc.so")) {
-            return 1;  // direct libc call - suspicious!
-        }
-    }
-    
-    return 0;  // not from libc - likely user code
-}
-
-/*
- * report memory corruption error
- * 
- * called when we detect double-free or invalid-free.
- * reports immediately (doesn't wait for program exit).
- * 
- * shows error type, address, and compact stack trace (top 7 frames).
- * stack trace can be disabled with PROFILER_STACK_TRACES=0
- */
-static void report_corruption_error(void *ptr, const char *error_type) {
-    char msg[128];
-    int len;
-    
-    len = snprintf(msg, sizeof(msg), 
-                   "[CORRUPTION] %s at %p\n",
-                   error_type, ptr);
-    write(STDERR_FILENO, msg, len);
-    
-    // show compact stack trace if enabled (top 7 frames only)
-    if (show_stack_traces) {
-        void *stack_trace[MAX_STACK_FRAMES];
-        int depth = backtrace(stack_trace, MAX_STACK_FRAMES);
-        int frames_to_show = (depth < 7) ? depth : 7;
-        backtrace_symbols_fd(stack_trace, frames_to_show, STDERR_FILENO);
-        write(STDERR_FILENO, "\n", 1);
-    }
-}
 
 // function pointers to the real libc malloc/free 
 static void* (*real_malloc)(size_t) = NULL;
@@ -342,4 +262,92 @@ void* realloc(void *ptr, size_t size) {
     }
     
     return new_ptr;
+}
+
+// safe output function - uses direct syscall, never calls malloc
+static void profiler_log(const char *msg) {
+    write(STDERR_FILENO, msg, strlen(msg));
+}
+
+/*
+ * check if allocation likely came from libc infrastructure
+ *
+ * examines stack trace to detect allocations from libc.so which are likely to use malloc internally-
+ * we cant control it, i dont want the user to see it.
+ * 
+ * key insight: we only check the immidiate caller (frame 1).
+ * we only care if libc DIRECTLY called malloc, not user code.
+ * 
+ * uses dladdr() which:
+ * - does NOT call malloc 
+ * - maps function address to its shared library- so we can detect if its lib.c
+ * 
+ * returns: 1 if suspicious (likely false positive), 0 if real leak
+ */
+static int is_likely_libc_allocation(void **stack_trace, int depth) {
+    if (!stack_trace || depth < 2) {
+        return 0;  // can't determine, assume real
+    }
+    
+    // only check frame 1 (immediate caller of malloc)
+    // frame 0 is malloc itself, frame 1 is who called malloc
+    // dl_info is a struct which holds the inforamtion about the shared libary
+    Dl_info info;
+    
+    // dladdr() fills the info structure based on the address in trace[1]
+    if (dladdr(stack_trace[1], &info) != 0) {
+        // check if immediate caller is from libc.so
+        if (info.dli_fname && strstr(info.dli_fname, "libc.so")) {
+            return 1;  // direct libc call, suspicious
+        }
+    }
+    
+    return 0;  // not from libc, likely user code
+}
+
+/*
+ * report memory corruption error
+ * 
+ * called when we detect double-free or invalid-free.
+ * reports immediately, doesn't wait for program exit.
+ * 
+ * outputs JSON format: {"type":"Double-Free or Invalid-Free","addr":"0x...","frames":[...]}
+ * stack trace can be disabled with PROFILER_STACK_TRACES=0
+ */
+static void report_corruption_error(void *ptr, const char *error_type) {
+    // Output corruption event in JSON format 
+    write_str("{\"type\":\"");
+    write_str(error_type);
+    write_str("\",\"addr\":\"");
+    write_hex((unsigned long)ptr);
+    write_str("\",\"frames\":[");
+    
+    // Capture and output stack trace if enabled (top 7 frames only)
+    if (show_stack_traces) {
+        void *stack_trace[MAX_STACK_FRAMES];
+        int depth = backtrace(stack_trace, MAX_STACK_FRAMES);
+        int frames_to_show = (depth < 7) ? depth : 7;
+        
+        for (int i = 0; i < frames_to_show; i++) {
+            if (i > 0) write_str(",");
+            
+            // Get binary name using dladdr()
+            Dl_info dl_info;
+            const char *binary_name = "unknown";
+            if (dladdr(stack_trace[i], &dl_info) && dl_info.dli_fname) {
+                // Extract just the filename from the full path
+                const char *slash = strrchr(dl_info.dli_fname, '/');
+                binary_name = slash ? (slash + 1) : dl_info.dli_fname;
+            }
+            
+            // Output: {"addr":"0x123","bin":"libprofiler.so"}
+            write_str("{\"addr\":\"");
+            write_hex((unsigned long)stack_trace[i]);
+            write_str("\",\"bin\":\"");
+            write_str(binary_name);
+            write_str("\"}");
+        }
+    }
+    
+    write_str("]}\n");
 }

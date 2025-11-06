@@ -43,7 +43,7 @@ typedef struct profiler_state {
 void hash_table_init(void);
 void hash_table_add(void *ptr, size_t size, void **trace, int depth, int is_suspicious);
 void hash_table_remove(void *ptr);
-int hash_table_find(void *ptr);  // returns 1 if found, 0 if not
+int hash_table_find(void *ptr);  
 void hash_table_report_leaks(void);
 void hash_table_cleanup(void);
 
@@ -53,5 +53,10 @@ extern void (*real_free_ptr)(void*);
 
 // Configuration (set by malloc_intercept.c)
 extern int show_stack_traces;  // 1 = enabled, 0 = disabled
+
+// JSON output helpers
+void write_str(const char *str);
+void write_hex(unsigned long val);
+void write_dec(size_t val);
 
 #endif // PROFILER_INTERNAL_H

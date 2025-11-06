@@ -13,15 +13,16 @@
 #include <string.h>
 #include <execinfo.h>  
 #include <unistd.h>
-#include <pthread.h>     
+#include <pthread.h>
+#include <dlfcn.h>       
 #include "../include/profiler_internal.h"
 #include "../include/uthash.h"
 
-// global state
+// pointer to hash table head
 static allocation_info_t *g_allocations = NULL;
 
 // mutex to protect hash table from concurrent access
-// PTHREAD_MUTEX_INITIALIZER: static initialization, safe before any threads exist
+// static initialization, safe before any threads exist
 static pthread_mutex_t hash_table_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
@@ -38,7 +39,6 @@ void hash_table_init(void) {
  * 
  * called immediately after malloc() succeeds.
  * we use real_malloc_ptr to allocate metadata (avoids recursion).
- * uthash's HASH_ADD_PTR does O(1) insertion.
  */
 void hash_table_add(void *ptr, size_t size ,void **trace, int depth, int is_suspicious) {
     if (!ptr) return;
@@ -53,6 +53,7 @@ void hash_table_add(void *ptr, size_t size ,void **trace, int depth, int is_susp
         return;
     }
     
+    // initialize metadata fields
     info->ptr = ptr;
     info->size = size;
     info->timestamp = time(NULL);
@@ -70,7 +71,7 @@ void hash_table_add(void *ptr, size_t size ,void **trace, int depth, int is_susp
     // lock before modifying shared hash table
     pthread_mutex_lock(&hash_table_mutex);
     
-    // add to hash table - O(1) operation
+    // add to hash table
     // for me : HASH_ADD_PTR(head, keyfield, item)
     HASH_ADD_PTR(g_allocations, ptr, info);
     
@@ -82,28 +83,28 @@ void hash_table_add(void *ptr, size_t size ,void **trace, int depth, int is_susp
  * remove an allocation from tracking
  * 
  * called when free() is called.
- * uthash's HASH_FIND_PTR does O(1) lookup.
  * 
  * thread safety: protected by hash_table_mutex
  */
 void hash_table_remove(void *ptr) {
     if (!ptr) return;
     
+    // find the allocation metadata
     allocation_info_t *found;
     
     // lock before accessing shared hash table
     pthread_mutex_lock(&hash_table_mutex);
     
-    // find the entry in hash table - O(1) operation
+    // find the entry in hash table
     // for me : HASH_FIND_PTR(head, key_ptr, output)
     HASH_FIND_PTR(g_allocations, &ptr, found);
     
     if (found) {
-        // remove from hash table - O(1) operation
+        // remove from hash table
         HASH_DEL(g_allocations, found);
     }
     
-    // unlock before freeing memory (don't need lock for that)
+    // unlock before freeing memory 
     pthread_mutex_unlock(&hash_table_mutex);
     
     // free outside the critical section 
@@ -135,23 +136,74 @@ int hash_table_find(void *ptr) {
     // lock before accessing shared hash table
     pthread_mutex_lock(&hash_table_mutex);
     
-    // find the entry in hash table - O(1) operation
+    // find the entry in hash table
     HASH_FIND_PTR(g_allocations, &ptr, found);
     
     // unlock immediately after lookup
     pthread_mutex_unlock(&hash_table_mutex);
     
-    return (found != NULL) ? 1 : 0;
+    if (found){
+         return 1;
+    }
+    return 0;
 }
 
 /*
- * report all leaked allocations
+ * output a single leak in JSON format
+ * uses only write() syscalls which are async-safe and do not use malloc internally (like printf)
+ * 
+ * Format: {"type":"leak","addr":"0x...","size":1024,"frames":[
+ *           {"addr":"0x123","bin":"libprofiler.so"},
+ *           {"addr":"0x456","bin":"test_program"}
+ *         ]}
+ */
+static void output_leak_json(allocation_info_t *info) {
+    write_str("{\"type\":\"leak\",\"addr\":\"");
+    write_hex((unsigned long)info->ptr);
+    write_str("\",\"size\":");
+    write_dec(info->size);
+    write_str(",\"frames\":[");
+    
+    // output stack trace frames with binary names
+    if (show_stack_traces && info->stack_trace && info->stack_depth > 0) {
+        // limit to top 7 frames
+        int frames_to_show = (info->stack_depth < 7) ? info->stack_depth : 7;
+        // output each frame
+        for (int i = 0; i < frames_to_show; i++) {
+            if (i > 0) write_str(",");
+            
+            // Get binary name using dladdr()
+            Dl_info dl_info;
+            // default is unkown
+            const char *binary_name = "unknown";
+            if (dladdr(info->stack_trace[i], &dl_info) && dl_info.dli_fname) {
+                // Extract just the filename from the full path
+                const char *slash = strrchr(dl_info.dli_fname, '/');
+                binary_name = slash ? (slash + 1) : dl_info.dli_fname;
+            }
+            
+            // Output: {"addr":"0x123","bin":"libprofiler.so"}
+            write_str("{\"addr\":\"");
+            write_hex((unsigned long)info->stack_trace[i]);
+            write_str("\",\"bin\":\"");
+            write_str(binary_name);
+            write_str("\"}");
+        }
+    }
+    
+    write_str("]}\n");
+}
+
+/*
+ * report all leaked allocations in JSON Lines format
  * 
  * called at program exit.
- * anything still in our table was allocated but never freed = memory leak.
- * uses HASH_ITER to safely iterate through all hash table entries.
+ * outputs structured JSON data (one object per line):
+ * - header: leak count and total bytes
+ * - leak: individual leak with address, size, and raw stack frames
+ * - summary: final statistics
  * 
- * separates output into confirmed leaks vs suspicious leaks (likely libc).
+ * separates confirmed leaks vs suspicious leaks (likely libc).
  */
 void hash_table_report_leaks(void) {
     allocation_info_t *current, *tmp;
@@ -160,21 +212,9 @@ void hash_table_report_leaks(void) {
     size_t confirmed_bytes = 0;
     size_t suspicious_bytes = 0;
     
-    // first pass: count and report confirmed leaks (user code)
+    // first pass: count leaks
     HASH_ITER(hh, g_allocations, current, tmp) {
         if (!current->is_suspicious) {
-            if (confirmed_count == 0) {
-                fprintf(stderr, "\n========== MEMORY LEAKS ==========\n");
-            }
-            fprintf(stderr, "[LEAK] %p: %zu bytes\n", current->ptr, current->size);
-            
-            // show stack trace if enabled (compact format - top 7 frames only)
-            if (show_stack_traces && current->stack_trace && current->stack_depth > 0) {
-                int frames_to_show = (current->stack_depth < 7) ? current->stack_depth : 7;
-                backtrace_symbols_fd(current->stack_trace, frames_to_show, STDERR_FILENO);
-            }
-            fprintf(stderr, "\n");
-            
             confirmed_count++;
             confirmed_bytes += current->size;
         } else {
@@ -183,16 +223,32 @@ void hash_table_report_leaks(void) {
         }
     }
     
-    // summary
-    if (confirmed_count > 0 || suspicious_count > 0) {
-        fprintf(stderr, "\nSummary:\n");
-        fprintf(stderr, "  Real leaks: %d allocation(s), %zu bytes\n", confirmed_count, confirmed_bytes);
-        if (suspicious_count > 0) {
-            fprintf(stderr, "  Libc infrastructure: %d allocation(s), %zu bytes (ignored)\n", 
-                    suspicious_count, suspicious_bytes);
+    // output header and leaks (only if there are leaks)
+    if (confirmed_count > 0) {
+        write_str("{\"type\":\"header\",\"leaks_count\":");
+        write_dec(confirmed_count);
+        write_str(",\"total_bytes\":");
+        write_dec(confirmed_bytes);
+        write_str("}\n");
+        
+        // output each leak
+        HASH_ITER(hh, g_allocations, current, tmp) {
+            if (!current->is_suspicious) {
+                output_leak_json(current);
+            }
         }
-        fprintf(stderr, "==================================\n\n");
     }
+    
+    // output summary
+    write_str("{\"type\":\"summary\",\"real_leaks\":");
+    write_dec(confirmed_count);
+    write_str(",\"real_bytes\":");
+    write_dec(confirmed_bytes);
+    write_str(",\"libc_leaks\":");
+    write_dec(suspicious_count);
+    write_str(",\"libc_bytes\":");
+    write_dec(suspicious_bytes);
+    write_str("}\n");
 }
 
 /*

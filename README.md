@@ -7,6 +7,7 @@ A low-level C library for Linux that automatically detects memory leaks, double-
 - ✅ malloc/free/calloc/realloc interception via LD_PRELOAD
 - ✅ Memory leak detection with O(1) hash table (uthash)
 - ✅ Stack trace capture showing allocation sites
+- ✅ Symbol resolution (filename:line format via post-processing)
 - ✅ Thread-safe operation with pthread mutexes
 - ✅ False positive filtering (libc infrastructure detection)
 - ✅ Double-free detection
@@ -20,23 +21,49 @@ A low-level C library for Linux that automatically detects memory leaks, double-
 # Build the profiler
 make
 
-# Test it
-make test
+# Run all tests with symbol resolution (recommended)
+make test-resolved
 
-# Use on your program (with stack traces - default)
-LD_PRELOAD=./libprofiler.so ./your_program
+# Run a single program with profiling
+./tools/run_profiler.sh ./your_program
 
-# Disable stack traces for cleaner output
-PROFILER_STACK_TRACES=0 LD_PRELOAD=./libprofiler.so ./your_program
+# Run with full stack traces (including system libraries)
+PROFILER_FULL_STACK=1 ./tools/run_profiler.sh ./your_program
 ```
 
 ## Configuration
 
 Control profiler behavior with environment variables:
 
-- `PROFILER_STACK_TRACES` - Show stack traces (default: enabled)
-  - `1` or unset: Show compact stack traces (top 7 frames)
-  - `0`: Hide stack traces, show only addresses
+- `PROFILER_FULL_STACK` - Control stack trace verbosity (default: clean mode)
+  - `0` or unset: **Clean mode** - Show only user code frames (recommended)
+  - `1`: **Full stack mode** - Show all frames including system libraries
+
+**Examples:**
+
+**Clean Mode (Default):**
+```bash
+./tools/run_profiler.sh ./your_program
+```
+Output shows only your code:
+```
+[LEAK] 0x7c43af0: 1024 bytes
+  at: your_program.c; line: 42
+  at: your_program.c; line: 15
+```
+
+**Full Stack Mode:**
+```bash
+PROFILER_FULL_STACK=1 ./tools/run_profiler.sh ./your_program
+```
+Output shows everything with labels:
+```
+[LEAK] 0x7c43af0: 1024 bytes
+  [SYS] <libprofiler.so+0x...>
+  [USR] at: your_program.c; line: 42
+  [SYS] <libc.so.6+0x...>
+  [USR] at: your_program.c; line: 15
+```
 
 ## How It Works
 
@@ -61,15 +88,13 @@ At program exit, we report any allocations that were never freed = **memory leak
 **Memory Leak Detection:**
 ```
 ========== MEMORY LEAKS ==========
-[LEAK] 0x55555555a2a0: 1024 bytes
-./libprofiler.so(malloc+0x84)[0x7f...]
-./your_program(create_buffer+0x1a)[0x55...]
-./your_program(main+0x43)[0x55...]
+Found 2 leak(s), 1536 bytes total
 
-[LEAK] 0x55555555a6b0: 512 bytes
-./libprofiler.so(malloc+0x84)[0x7f...]
-./your_program(helper_function+0x30)[0x55...]
-./your_program(main+0xd4)[0x55...]
+[LEAK] 0x7c43af0: 1024 bytes
+  at: your_program.c; line: 42
+
+[LEAK] 0x7c43b50: 512 bytes
+  at: your_program.c; line: 87
 
 Summary:
   Real leaks: 2 allocation(s), 1536 bytes
@@ -79,10 +104,8 @@ Summary:
 
 **Corruption Detection:**
 ```
-[CORRUPTION] Double-Free or Invalid-Free at 0x55555555a2a0
-./libprofiler.so(+0x15dd)[0x7f...]
-./libprofiler.so(free+0x85)[0x7f...]
-./your_program(main+0x8b)[0x55...]
+[CORRUPTION] Double-Free or Invalid-Free at 0x7c43af0
+  at: your_program.c; line: 95
 ```
 
 ## Project Structure
@@ -96,6 +119,9 @@ c-systems-integrity-lib/
 ├── include/
 │   ├── profiler_internal.h  # Internal data structures
 │   └── uthash.h             # Third-party hash table library
+├── tools/
+│   ├── resolve_symbols.py   # Symbol resolution tool
+│   └── run_profiler.sh      # Wrapper script for easy profiling
 ├── tests/
 │   ├── test_simple_leak.c   # Basic leak detection
 │   ├── test_no_leak.c       # Zero-leak verification
